@@ -1,0 +1,273 @@
+name: Schedule PR Merge
+
+on:
+  issue_comment:
+    types: [created]
+  schedule:
+    # Run every hour to check for scheduled merges
+    - cron: '0 * * * *'
+
+jobs:
+  process-schedule-command:
+    if: github.event_name == 'issue_comment' && github.event.issue.pull_request && startsWith(github.event.comment.body, '/schedule')
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: write
+      issues: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Parse schedule command
+        id: parse
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const comment = context.payload.comment.body;
+            const match = comment.match(/\/schedule\s+(\d{2}-\d{2}-\d{4})(?:\s+(\d{1,2}):(\d{2}))?/);
+            
+            if (!match) {
+              core.setFailed('Invalid schedule format. Use: /schedule DD-MM-YYYY [HH:MM] (24-hour format)');
+              return;
+            }
+            
+            const [_, date, hours, minutes] = match;
+            const [day, month, year] = date.split('-');
+            
+            const hour = hours ? parseInt(hours) : 0;
+            const minute = minutes ? parseInt(minutes) : 0;
+            
+            // Validate hour and minute
+            if (hour < 0 || hour > 23) {
+              core.setFailed('Hour must be between 0 and 23 (24-hour format)');
+              return;
+            }
+            if (minute < 0 || minute > 59) {
+              core.setFailed('Minute must be between 0 and 59');
+              return;
+            }
+            
+            // Create ISO timestamp (UTC)
+            const scheduleDate = new Date(Date.UTC(year, month - 1, day, hour, minute));
+            
+            if (isNaN(scheduleDate.getTime())) {
+              core.setFailed('Invalid date');
+              return;
+            }
+            
+            const now = new Date();
+            if (scheduleDate <= now) {
+              core.setFailed('Schedule date must be in the future');
+              return;
+            }
+            
+            core.setOutput('timestamp', scheduleDate.toISOString());
+            core.setOutput('readable', scheduleDate.toUTCString());
+            
+            // Store schedule info as a comment
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `✅ PR merge scheduled for: **${scheduleDate.toUTCString()}**\n\nThe PR will be automatically merged at this time if all checks pass and it's approved.\n\nTo cancel, comment \`/cancel-schedule\``
+            });
+            
+            // Add label to track scheduled PRs
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: ['scheduled-merge']
+            });
+      
+      - name: Store schedule in PR
+        if: steps.parse.outputs.timestamp
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const timestamp = '${{ steps.parse.outputs.timestamp }}';
+            const prNumber = context.issue.number;
+            
+            // Store the schedule as a comment with a special marker for easy retrieval
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: `<!-- SCHEDULE_DATA:${timestamp} -->`
+            });
+
+  cancel-schedule-command:
+    if: github.event_name == 'issue_comment' && github.event.issue.pull_request && startsWith(github.event.comment.body, '/cancel-schedule')
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: write
+      issues: write
+    
+    steps:
+      - name: Cancel scheduled merge
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.issue.number;
+            
+            // Check if the PR has the scheduled-merge label
+            const { data: pr } = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber
+            });
+            
+            const hasLabel = pr.labels.some(label => label.name === 'scheduled-merge');
+            
+            if (!hasLabel) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: '⚠️ This PR does not have a scheduled merge.'
+              });
+              return;
+            }
+            
+            // Remove the scheduled-merge label
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                name: 'scheduled-merge'
+              });
+              
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: '✅ Scheduled merge cancelled successfully!'
+              });
+            } catch (error) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: `❌ Failed to cancel scheduled merge: ${error.message}`
+              });
+            }
+
+  check-scheduled-merges:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: write
+      issues: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Find and merge scheduled PRs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const now = new Date();
+            
+            // Find all PRs with the scheduled-merge label
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open'
+            });
+            
+            for (const pr of prs) {
+              // Check if PR has scheduled-merge label
+              const hasLabel = pr.labels.some(label => label.name === 'scheduled-merge');
+              if (!hasLabel) continue;
+              
+              // Get all comments to find the schedule
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number
+              });
+              
+              // Find the schedule comment
+              const scheduleComment = comments.find(c => 
+                c.body.includes('<!-- SCHEDULE_DATA:')
+              );
+              
+              if (!scheduleComment) continue;
+              
+              const match = scheduleComment.body.match(/<!-- SCHEDULE_DATA:(.+?) -->/);
+              if (!match) continue;
+              
+              const scheduleTime = new Date(match[1]);
+              
+              // Check if it's time to merge
+              if (now >= scheduleTime) {
+                console.log(`Time to merge PR #${pr.number}`);
+                
+                // Check if PR is mergeable
+                const { data: prDetails } = await github.rest.pulls.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: pr.number
+                });
+                
+                if (!prDetails.mergeable) {
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: pr.number,
+                    body: '❌ Scheduled merge failed: PR has conflicts or is not mergeable.'
+                  });
+                  await github.rest.issues.removeLabel({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: pr.number,
+                    name: 'scheduled-merge'
+                  });
+                  continue;
+                }
+                
+                // Attempt to merge
+                try {
+                  await github.rest.pulls.merge({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    pull_number: pr.number,
+                    merge_method: 'merge', // Can be 'merge', 'squash', or 'rebase'
+                    commit_title: `Scheduled merge of PR #${pr.number}`,
+                    commit_message: `Automatically merged as scheduled for ${scheduleTime.toUTCString()}`
+                  });
+                  
+                  console.log(`Successfully merged PR #${pr.number}`);
+                  
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: pr.number,
+                    body: '✅ PR automatically merged as scheduled!'
+                  });
+                } catch (error) {
+                  console.error(`Failed to merge PR #${pr.number}:`, error.message);
+                  
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: pr.number,
+                    body: `❌ Scheduled merge failed: ${error.message}\n\nThis might be due to:\n- PR not being approved\n- Required checks not passing\n- Branch protection rules not met`
+                  });
+                  
+                  // Remove the label so we don't keep trying
+                  await github.rest.issues.removeLabel({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: pr.number,
+                    name: 'scheduled-merge'
+                  });
+                }
+              }
+            }
