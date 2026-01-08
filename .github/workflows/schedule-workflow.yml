@@ -29,7 +29,7 @@ jobs:
             const match = comment.match(/\/schedule\s+(\d{2}-\d{2}-\d{4})(?:\s+(\d{1,2}):(\d{2}))?/);
             
             if (!match) {
-              core.setFailed('Invalid schedule format. Use: /schedule DD-MM-YYYY [HH:MM] (24-hour format)');
+              core.setFailed('Invalid schedule format. Use: /schedule DD-MM-YYYY [HH:MM] (24-hour format in CET)');
               return;
             }
             
@@ -49,8 +49,37 @@ jobs:
               return;
             }
             
-            // Create ISO timestamp (UTC)
-            const scheduleDate = new Date(Date.UTC(year, month - 1, day, hour, minute));
+            // Determine CET/CEST offset
+            const targetMonth = parseInt(month) - 1;
+            const targetDay = parseInt(day);
+            let cetOffset = 1; // Standard CET is UTC+1
+            
+            // DST for Europe: last Sunday of March to last Sunday of October
+            if (targetMonth > 2 && targetMonth < 9) {
+              cetOffset = 2; // CEST (summer time)
+            } else if (targetMonth === 2) {
+              // March - check if after last Sunday
+              const lastDay = new Date(parseInt(year), 3, 0).getDate();
+              const lastDayOfMonth = new Date(parseInt(year), 2, lastDay);
+              const lastSunday = lastDay - lastDayOfMonth.getDay();
+              if (targetDay >= lastSunday) cetOffset = 2;
+            } else if (targetMonth === 9) {
+              // October - check if before last Sunday
+              const lastDay = new Date(parseInt(year), 10, 0).getDate();
+              const lastDayOfMonth = new Date(parseInt(year), 9, lastDay);
+              const lastSunday = lastDay - lastDayOfMonth.getDay();
+              if (targetDay < lastSunday) cetOffset = 2;
+            }
+            
+            // Convert CET time to UTC
+            const scheduleDate = new Date(Date.UTC(
+              parseInt(year),
+              parseInt(month) - 1,
+              parseInt(day),
+              hour - cetOffset, // Subtract offset to get UTC
+              minute,
+              0
+            ));
             
             if (isNaN(scheduleDate.getTime())) {
               core.setFailed('Invalid date');
@@ -63,15 +92,24 @@ jobs:
               return;
             }
             
-            core.setOutput('timestamp', scheduleDate.toISOString());
-            core.setOutput('readable', scheduleDate.toUTCString());
+            // Format display time
+            const displayFormatter = new Intl.DateTimeFormat('en-GB', {
+              timeZone: 'Europe/Paris',
+              day: '2-digit',
+              month: '2-digit',
+              year: 'numeric',
+              hour: '2-digit',
+              minute: '2-digit',
+              timeZoneName: 'short'
+            });
+            const cetTimeDisplay = displayFormatter.format(scheduleDate);
             
-            // Store schedule info as a comment
+            // Single comment with hidden data marker
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: `✅ PR merge scheduled for: **${scheduleDate.toUTCString()}**\n\nThe PR will be automatically merged at this time if all checks pass and it's approved.\n\nTo cancel, comment \`/cancel-schedule\``
+              body: `✅ PR merge scheduled for: **${cetTimeDisplay}**\n\nThe PR will be automatically merged at this time if all checks pass and it's approved.\n\nTo cancel, comment \`/cancel-schedule\`\n\n<!-- SCHEDULE_DATA:${scheduleDate.toISOString()} -->`
             });
             
             // Add label to track scheduled PRs
@@ -80,22 +118,6 @@ jobs:
               repo: context.repo.repo,
               issue_number: context.issue.number,
               labels: ['scheduled-merge']
-            });
-      
-      - name: Store schedule in PR
-        if: steps.parse.outputs.timestamp
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const timestamp = '${{ steps.parse.outputs.timestamp }}';
-            const prNumber = context.issue.number;
-            
-            // Store the schedule as a comment with a special marker for easy retrieval
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: prNumber,
-              body: `<!-- SCHEDULE_DATA:${timestamp} -->`
             });
 
   cancel-schedule-command:
@@ -193,13 +215,14 @@ jobs:
                 issue_number: pr.number
               });
               
-              // Find the schedule comment
-              const scheduleComment = comments.find(c => 
+              // Find the most recent schedule comment
+              const scheduleComments = comments.filter(c => 
                 c.body.includes('<!-- SCHEDULE_DATA:')
-              );
+              ).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
               
-              if (!scheduleComment) continue;
+              if (scheduleComments.length === 0) continue;
               
+              const scheduleComment = scheduleComments[0]; // Get most recent
               const match = scheduleComment.body.match(/<!-- SCHEDULE_DATA:(.+?) -->/);
               if (!match) continue;
               
